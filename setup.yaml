@@ -1,0 +1,231 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: coder
+  namespace: coder
+data:
+  password: some-base64-password-here
+
+---
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fuse-device-plugin-daemonset # /dev/fuse proxy DS
+  namespace: coder
+spec:
+  selector:
+    matchLabels:
+      name: fuse-device-plugin-ds
+  template:
+    metadata:
+      labels:
+        name: fuse-device-plugin-ds
+    spec:
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: ''
+      containers:
+        - name: fuse-device-plugin-ctr
+          image: quay.io/nextflow/k8s-fuse-plugin:0.2
+          args:
+            - '--mounts-allowed=5000'
+          resources: {}
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+            allowPrivilegeEscalation: false
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 0
+      dnsPolicy: ClusterFirst
+      hostNetwork: true
+
+---
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: coder
+  namespace: coder
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/podman: unconfined # AppArmor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coder
+  template:
+    metadata:
+      labels:
+        app: coder
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/podman: unconfined # AppArmor
+    spec:
+      initContainers:
+        - name: init-chmod-data # Needed to fix file permissions on volumes and ensures podman has local storage set up. Runs as root.
+          image: busybox:latest
+          command:
+            - sh
+            - '-c'
+            - |
+              mkdir -p /home/podman/.local/share/containers/storage
+              chown -R 1000:1000 /home/coder
+              chown -R 1000:1000 /home/podman/.local
+          resources: {}
+          volumeMounts:
+            - name: coder
+              mountPath: /home/coder
+            - name: podman
+              mountPath: /home/podman/.local
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+        - name: customization # Used to customize the /home/coder volume. Runs with the code-server image, so we have CLI access to install extensions for example.
+          image: codercom/code-server:latest
+          command:
+            - sh
+            - '-c'
+            - |
+              mkdir -p /home/coder/bin
+              chmod +x -R /home/coder/bin
+              echo '' > /home/coder/.bashrc
+              echo 'export PATH=$PATH:/home/coder/bin' >> /home/coder/.bashrc # an useful bin folder, added to PATH
+              echo "alias docker='podman --remote --url tcp://localhost:8081'" >> /home/coder/.bashrc  # docker = podman with extra steps :)
+          env:
+            - name: SERVICE_URL
+              value: https://open-vsx.org/vscode/gallery
+            - name: ITEM_URL
+              value: https://open-vsx.org/vscode/item
+          resources: {}
+          volumeMounts:
+            - name: coder
+              mountPath: /home/coder
+          imagePullPolicy: IfNotPresent
+      containers:
+        - name: podman # Contains podman, which we run as a separate sidecar. Can be controlled via TCP. Port 8081.
+          image: quay.io/podman/stable
+          command:
+            - /bin/sh
+            - '-c'
+          args:
+            - podman system service --time=0 tcp:0.0.0.0:8081
+          ports:
+            - name: podman
+              containerPort: 8081
+              protocol: TCP
+          resources:
+            limits:
+              nextflow.io/fuse: '1' # run on machines with the plugin for /dev/fuse
+          volumeMounts:
+            - name: podman
+              mountPath: /home/podman/.local/share/containers
+            - name: coder
+              mountPath: /home/coder
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 1000
+        - name: coder # CODER!
+          image: codercom/code-server:latest
+          ports:
+            - name: web
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: password
+          volumeMounts:
+            - name: coder
+              mountPath: /home/coder
+          lifecycle:
+            postStart:
+              exec:
+                command: # runs before container boot, as coder user. we have sudo rights here.
+                  - /bin/bash
+                  - '-c'
+                  - |
+                    sudo apt-get update
+                    sudo apt-get install podman -y # we need the podman cli. we'll use it with --remote.
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsUser: 1000
+  volumeClaimTemplates:
+    - kind: PersistentVolumeClaim
+      apiVersion: v1
+      metadata:
+        name: coder
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+      status:
+        phase: Pending
+    - kind: PersistentVolumeClaim
+      apiVersion: v1
+      metadata:
+        name: podman
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+  serviceName: coder
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: coder
+  namespace: coder
+spec:
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  selector:
+    app: coder
+  type: ClusterIP
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: coder
+  namespace: coder
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    nginx.ingress.kubernetes.io/proxy-body-size: 256m
+    nginx.ingress.kubernetes.io/ssl-redirect: 'true'
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - coder.somedomain.com
+      secretName: coder-ingress-tls
+  rules:
+    - host: coder.somedomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: coder
+                port:
+                  number: 80
